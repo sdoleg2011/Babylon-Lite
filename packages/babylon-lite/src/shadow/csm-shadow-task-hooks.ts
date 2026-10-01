@@ -97,6 +97,10 @@ export interface CsmTaskState extends ShadowTaskInternalState {
     _casterMatGens: Map<Material, number | undefined>;
     /** @internal Per-caster cascade-cap snapshot used to update task membership incrementally. */
     _casterMaxCascades: Map<Mesh, number | undefined>;
+    /** @internal The changed casters the last incremental diff kept out of every task while the rebuild was held
+     *  (`scanCsmCasterMaterials`). While the hold is unchanged the scan hands this set back, so an ensure with the same
+     *  caster array and scene versions touches no task. */
+    _held?: Set<Mesh>;
     /** @internal Pre-allocated scratch storage for per-frame cascade computation, sized for `_numCascades`. */
     _cascadeScratch: CsmCascadeScratch;
 }
@@ -152,10 +156,10 @@ export function ensureCsmShadowTaskState(
 ): CsmTaskState {
     const existing = existingState as CsmTaskState | null;
     if (existing) {
-        // `true` when the cascades rebuild now, else the casters the incremental path leaves alone (`scanCsmCasterMaterials`).
+        // `true` when the cascades rebuild now, else the casters the incremental path keeps out (`scanCsmCasterMaterials`):
+        // `existing._held` itself while that is unchanged, so an unresolved hold costs no diff.
         const deferred = scanCsmCasterMaterials(scene, sg, existing, casterMeshes);
-        const casterMatChanged = deferred === true;
-        if (!casterMatChanged && existing._casterMeshes === casterMeshes && existing._renderableVersion === scene._renderableVersion) {
+        if (deferred === existing._held && existing._casterMeshes === casterMeshes && existing._renderableVersion === scene._renderableVersion) {
             return existing;
         }
         // The caster set is unchanged and NO material was rebuilt/swapped since these tasks were built (the
@@ -167,7 +171,7 @@ export function ensureCsmShadowTaskState(
         // geometry edit re-compiles pipelines + churns bind-groups/bundles for the whole caster set (multi-MB,
         // never returned by the GPU allocator). Only a real material change (epoch bump) needs a full rebuild,
         // because that destroys the caster UBOs the cached views point at.
-        if (!casterMatChanged && existing._casterMeshes === casterMeshes && existing._materialEpoch === scene._materialEpoch) {
+        if (deferred === existing._held && existing._casterMeshes === casterMeshes && existing._materialEpoch === scene._materialEpoch) {
             existing._renderableVersion = scene._renderableVersion;
             return existing;
         }
@@ -182,7 +186,7 @@ export function ensureCsmShadowTaskState(
         // leaking ~casters×cascades handles every time the caster list was re-supplied, which a consumer may do
         // per frame). Only add the new casters / drop departed ones (a regenerated caster's old packet is freed
         // by removeFromScene when its mesh is disposed; a persistent caster simply keeps its packet).
-        if (!casterMatChanged) {
+        if (deferred !== true) {
             const nextSet = new Set(casterMeshes);
             const views = existing._materialViews;
             const materials = existing._casterMaterials;
@@ -190,21 +194,26 @@ export function ensureCsmShadowTaskState(
             const caps = existing._casterMaxCascades;
             const tasks = existing._tasks;
             for (const m of existing._casterMeshes) {
-                if (!nextSet.has(m) || (m._shadowMaxCascade !== caps.get(m) && !deferred?.has(m))) {
-                    caps.delete(m);
+                // While the rebuild is held, a caster with a changed material leaves every cascade (its packets retired
+                // behind the frame fence): the resources they reference may be retired with its old material already.
+                // It keeps its cap, so the rebuild still counts it as registered.
+                const held = deferred?.has(m);
+                if (!nextSet.has(m) || held || m._shadowMaxCascade !== caps.get(m)) {
+                    if (!held) {
+                        caps.delete(m);
+                    }
                     for (const t of tasks) {
                         removeMeshFromTask(t, m);
                     }
                 }
             }
-            let unapplied = false;
             for (const m of casterMeshes) {
                 if (deferred?.has(m)) {
-                    unapplied ||= !caps.has(m) || m._shadowMaxCascade !== caps.get(m);
                     continue;
                 }
                 const maxCascade = m._shadowMaxCascade;
-                if (!caps.has(m) && m.material) {
+                // A caster the last diff kept out rejoins here when its change was reverted.
+                if ((!caps.has(m) || existing._held?.has(m)) && m.material) {
                     const view = getNoColorView(m.material, views);
                     for (let c = 0; c < tasks.length; c++) {
                         if (c <= (maxCascade ?? c)) {
@@ -222,11 +231,9 @@ export function ensureCsmShadowTaskState(
             }
             existing._casterMeshes = casterMeshes;
             existing._renderableVersion = scene._renderableVersion;
-            if (unapplied) {
-                // A held caster has not joined or taken its new cap yet. A hold can lift without a rebuild or a version
-                // bump (a view factory import lands, the change is reverted), so the next ensure must run the diff again.
-                existing._renderableVersion = existing._materialEpoch = -1;
-            }
+            // A hold can lift without a version bump (a view factory import lands, a change is reverted): the scan then
+            // returns something other than this set, and the diff runs again.
+            existing._held = deferred;
             return existing;
         }
         // A CASTER material was actually rebuilt or switched (a material swap rebuilds its renderable + UBOs but
@@ -338,9 +345,11 @@ export function ensureCsmShadowTaskState(
  *  to the set with an unseen material is expected: the incremental diff builds its view.
  *
  *  The rebuild records every caster, so while any changed caster's view cannot be built yet (`holdCsmCasterRebuild`) it
- *  is held, and this returns the changed casters for the incremental diff to leave alone: a registered one keeps its old
- *  packets and cap, and a new one stays out. Adding a new one through the cached view would snapshot its material, and
- *  a registered caster sharing that material would then never rebuild. Returns `undefined` when nothing changed. */
+ *  is held, and this returns the changed casters for the incremental diff to keep out of every task until the rebuild:
+ *  their packets may reference resources retired with their old material, and a frame this ensure did not see (the
+ *  generator was parked) may already have retired them. A new one stays out as well: adding it through the cached view
+ *  would snapshot its material, and a registered caster sharing that material would then never rebuild. Returns
+ *  `state._held` itself while the held casters are unchanged, and `undefined` when nothing changed. */
 export function scanCsmCasterMaterials(scene: SceneContext, sg: ShadowGenerator, state: CsmTaskState, casterMeshes: readonly Mesh[]): Set<Mesh> | true | undefined {
     const materials = state._casterMaterials;
     let rebuild = false;
@@ -360,7 +369,11 @@ export function scanCsmCasterMaterials(scene: SceneContext, sg: ShadowGenerator,
         }
         (deferred ??= new Set()).add(mesh);
     }
-    return rebuild && !hold ? true : deferred;
+    if (!hold) {
+        return rebuild || undefined;
+    }
+    const held = state._held;
+    return held?.size === deferred!.size && [...deferred!].every((mesh) => held.has(mesh)) ? held : deferred;
 }
 
 /** Whether the no-colour view of a caster material cannot be built yet. When the view factory of the family the caster

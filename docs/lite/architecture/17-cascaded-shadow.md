@@ -368,19 +368,31 @@ Caster material changes are read from the task state's material snapshot
   the no-colour view factory of its family is not imported (the generator is parked
   once while it imports, as for a re-supplied set), or the material it casts through
   itself has no completed group build in this scene (its swap drain or runtime build
-  provides one). Nothing is retired or created while the rebuild is held. A
-  `setShadowCasterMaterial` override is not held for its group; recording it throws as
-  before.
-- **What a held caster draws.** Caster-set changes still apply through the incremental
-  diff, which leaves every caster with a changed material alone: a registered one
-  keeps drawing its old packets at its old cap, and a new one stays out. The diff stays
-  unapplied until those casters join or take their cap, so a hold that lifts without a
-  rebuild (a factory import lands, the change is reverted) still adds them.
+  provides one). No cascade task or cache texture is created while the rebuild is
+  held; set changes still apply, and held casters leave the cascades (below). A `setShadowCasterMaterial` override is not held for its
+  group; recording it throws as before. The scan hands back the hold the last
+  incremental diff applied (`_held`) while it is unchanged, so a frame with the same
+  caster array and scene versions returns without touching any task. The diff runs
+  again when the array or a scene version changes, or when the hold changes or lifts,
+  also without a version bump (a factory import lands, a change is reverted).
+- **What a held caster draws.** Nothing. Caster-set changes still apply through the
+  incremental diff, but every caster with a changed material leaves every cascade task
+  (and static-cache task), its packets retired once behind the frame fence. Those
+  packets were built through its previous material and may reference per-mesh
+  resources retired with it, possibly in a frame the shadow task did not see because
+  the generator was parked. A registered caster keeps its cap entry, so the rebuild
+  still counts it; it casts again once the rebuild records it through a fresh view, or
+  rejoins through the diff if its change is reverted. A new caster stays out until it
+  can join. The depth a held caster last rendered stays in the map until the cascades
+  redraw.
 - **Not covered.** A registered caster whose material becomes `null` keeps casting
-  through its old packets. A group that never builds keeps the rebuild held until the
-  caster's material is reassigned or the caster leaves the set: after a failed runtime
-  build, which reports its own error, or for a caster mesh outside the scene, which
-  gets no build.
+  through its old packets. A group that never builds keeps the rebuild held, and the
+  held casters out of the cascades, until the caster's material is reassigned or the
+  caster leaves the set: after a failed runtime build, which reports its own error, or
+  for a caster mesh outside the scene, which gets no build. A caster that switches
+  material and back while the generator is parked, with the switch back still queued
+  behind an in-flight runtime build, keeps its packets: the scan sees the same material
+  and `_csmGen` (this also happens without a hold).
 
 ## Babylon.js Equivalence Map
 
@@ -453,10 +465,22 @@ tasks after a live cap change.
 modules per case so no view factory leaks between cases. For the default and
 static-cache hooks it proves that a registered caster switching to (or getting) an
 unseen material rebuilds through it and keeps the refit gate, that a new caster with an
-unseen material stays incremental, that a held rebuild neither throws nor retires
+unseen material stays incremental, that a held rebuild neither throws nor rebuilds
 anything and parks the generator once, that set changes apply during a hold while held
-casters keep their old packets and caps, and that held casters join when the hold lifts
-with or without a rebuild. An override whose group is not built still throws.
+casters stay out of every task with their caps kept for the rebuild, and that held
+casters join when the hold lifts with or without a rebuild. An override whose group is
+not built still throws. With packets that own resources and per-mesh resources retired
+by `rebuildMaterial` or the swap drain, it proves that a caster rebuilt during a hold
+leaves every task (static-cache tasks included) in that frame, its packets retired once
+behind the fence, and casts again through a fresh view once the held build lands or the
+held caster leaves; that a held caster whose previous material was rebuilt is dropped
+too; that a dropped caster rejoins when its switch is reverted; and that no draw
+submits a released resource of a held caster whose material was switched while the
+generator was parked, whether it then waits for its view factory (the pass whose ensure
+parks the generator again still draws) or for its group. Frames of an unresolved hold
+leave every task's bundles and binding version alone and retire nothing, and a pending
+caster or cap is applied once when the hold lifts by a group build or, without a
+version bump, by a factory import.
 
 `tests/lite/unit/csm-refit-gate.test.ts` validates stable re-supply, version-sum
 collision handling, promotion/demotion timing, angular drift, and interval refits.

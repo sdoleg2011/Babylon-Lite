@@ -213,17 +213,16 @@ export function ensureCsmShadowCacheState(
         replacedDefaultState = true;
     }
     if (existing) {
-        // Same rules as the default hooks (`scanCsmCasterMaterials`).
+        // Same rules as the default hooks (`scanCsmCasterMaterials`), including an unchanged hold handed back as `_held`.
         const deferred = scanCsmCasterMaterials(scene, sg, existing, casterMeshes);
-        const casterMatChanged = deferred === true;
-        if (!casterMatChanged && existing._casterMeshes === casterMeshes && existing._renderableVersion === scene._renderableVersion) {
+        if (deferred === existing._held && existing._casterMeshes === casterMeshes && existing._renderableVersion === scene._renderableVersion) {
             return existing;
         }
-        if (!casterMatChanged && existing._casterMeshes === casterMeshes && existing._materialEpoch === scene._materialEpoch) {
+        if (deferred === existing._held && existing._casterMeshes === casterMeshes && existing._materialEpoch === scene._materialEpoch) {
             existing._renderableVersion = scene._renderableVersion;
             return existing;
         }
-        if (!casterMatChanged) {
+        if (deferred !== true) {
             const nextSet = new Set(casterMeshes);
             const views = existing._materialViews;
             const materials = existing._casterMaterials;
@@ -231,8 +230,12 @@ export function ensureCsmShadowCacheState(
             const caps = existing._casterMaxCascades;
             existing._gate.syncCasters(casterMeshes);
             for (const mesh of existing._casterMeshes) {
-                if (!nextSet.has(mesh) || (mesh._shadowMaxCascade !== caps.get(mesh) && !deferred?.has(mesh))) {
-                    caps.delete(mesh);
+                // As in the default hooks, a held caster leaves every task (static-cache ones too) and keeps its cap.
+                const held = deferred?.has(mesh);
+                if (!nextSet.has(mesh) || held || mesh._shadowMaxCascade !== caps.get(mesh)) {
+                    if (!held) {
+                        caps.delete(mesh);
+                    }
                     for (const task of existing._tasks) {
                         removeMeshFromTask(task, mesh);
                     }
@@ -241,14 +244,12 @@ export function ensureCsmShadowCacheState(
                     }
                 }
             }
-            let unapplied = false;
             for (const mesh of casterMeshes) {
                 if (deferred?.has(mesh)) {
-                    unapplied ||= !caps.has(mesh) || mesh._shadowMaxCascade !== caps.get(mesh);
                     continue;
                 }
                 const maxCascade = mesh._shadowMaxCascade;
-                if (!caps.has(mesh) && mesh.material) {
+                if ((!caps.has(mesh) || existing._held?.has(mesh)) && mesh.material) {
                     const view = getNoColorView(mesh.material, views);
                     for (let cascade = 0; cascade < existing._tasks.length; cascade++) {
                         if (cascade <= (maxCascade ?? cascade)) {
@@ -266,10 +267,7 @@ export function ensureCsmShadowCacheState(
             }
             existing._casterMeshes = casterMeshes;
             existing._renderableVersion = scene._renderableVersion;
-            if (unapplied) {
-                // As in the default hooks: run the diff again until every held caster has joined and taken its cap.
-                existing._renderableVersion = existing._materialEpoch = -1;
-            }
+            existing._held = deferred;
             return existing;
         }
         retireGpuResources(engine, existing._task.dispose);
